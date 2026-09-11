@@ -32,6 +32,34 @@ class MnetPlusBaseIE(InfoExtractor):
                 cookie_value = value.split('=', 1)[1]
                 self._set_cookie(video_domain, cookie_name, cookie_value)
 
+    def _extract_higher_res_fallbacks(self, formats, video_id):
+        # The master m3u8 is capped at 720p for non-premium accounts
+        # (API reports 1080/2160 as available=False, isPremiumFeature=True),
+        # but the underlying _1080pw/_2160pw variant playlists are still
+        # accessible with normal free-login CloudFront cookies.
+        urls = {f.get('url') for f in formats if f.get('url')}
+        base_720 = next((u for u in urls if '_720' in u), None)
+        if not base_720:
+            return []
+        base_720_fmt = next((f for f in formats if f.get('url') == base_720), {})
+        extra = []
+        for res in ('1080',):
+            guess = base_720.replace('_720', f'_{res}')
+            if guess in urls or guess == base_720:
+                continue
+            more, _ = self._extract_m3u8_formats_and_subtitles(
+                guess, video_id, 'mp4', m3u8_id=f'hls-{res}-fallback', fatal=False)
+            for f in more:
+                f.setdefault('height', int(res))
+                # Media playlists carry no codec info; mark video-only so the
+                # default selector still merges separate audio instead of
+                # treating this as a complete format (else: silent video).
+                f.setdefault('vcodec', base_720_fmt.get('vcodec'))
+                f.setdefault('acodec', 'none')
+            extra.extend(more)
+            urls.update(f.get('url') for f in more if f.get('url'))
+        return extra
+
     def _get_subtitles(self, captions_domain, video_id, caption_id, duration, lang_configs, headers):
         return self._fetch_captions(
             captions_domain, video_id, caption_id, duration, lang_configs, headers,
@@ -98,14 +126,17 @@ class MnetPlusBaseIE(InfoExtractor):
             if not cues_data:
                 break
 
-            content_map = cues_data.get('contentMap') or {}
-            if not content_map:
-                break
-
             if caption_interval is None:
                 caption_interval = int_or_none(cues_data.get('captionIntervalSecond'))
                 if caption_interval is None:
                     break
+
+            content_map = cues_data.get('contentMap') or {}
+            if not content_map:
+                # Some languages return an empty page at offset 0 but have
+                # content at later offsets, so skip instead of stopping.
+                offset += caption_interval
+                continue
 
             for cue_key in sorted(content_map.keys(), key=int):
                 cue = content_map[cue_key]
@@ -286,6 +317,7 @@ class MnetPlusVideoIE(MnetPlusBaseIE):
 
         formats, hls_subtitles = self._extract_m3u8_formats_and_subtitles(
             video_master_url, video_id, 'mp4', m3u8_id='hls', fatal=False)
+        formats.extend(self._extract_higher_res_fallbacks(formats, video_id))
 
         video_caption = traverse_obj(video_json, ('videoCaption', {dict})) or {}
         caption_id = video_caption.get('videoCaptionId')
@@ -371,6 +403,7 @@ class MnetPlusLiveIE(MnetPlusBaseIE):
 
         formats, hls_subtitles = self._extract_m3u8_formats_and_subtitles(
             live_url, video_id, 'mp4', m3u8_id='hls', fatal=False)
+        formats.extend(self._extract_higher_res_fallbacks(formats, video_id))
 
         subtitles = {}
         for lang, sub_entries in hls_subtitles.items():
